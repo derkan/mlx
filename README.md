@@ -1,6 +1,3 @@
-Here’s a tighter, “viral-ready” README with stronger positioning, clearer hooks, and GitHub-friendly structure (badges, quick wins, tone, scannability).
-
----
 
 # ⚡ mlx — Ollama-style CLI for Apple MLX
 
