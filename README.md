@@ -133,6 +133,8 @@ mlx search --fit --limit 50
 mlx search --fit --ram 48
 mlx search --json
 mlx search --refresh
+mlx search --community-only
+mlx search --author lmstudio-community
 ```
 
 > mlx search --fit is an estimate based on model repo metadata, quantization hints, weight sizes, and available RAM. It is meant to be useful and conservative, not perfect.
