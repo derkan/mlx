@@ -1,0 +1,849 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# mlx - lightweight MLX CLI wrapper for Apple Silicon macOS
+# Compatible with macOS default Bash 3.2+ (no associative arrays).
+
+VERSION="0.1.0"
+PYTHON_DEFAULT="3.12.10"
+DEFAULT_MODEL_BOOTSTRAP="mlx-community/Llama-3.2-3B-Instruct-4bit"
+DEFAULT_MODEL_CODE="mlx-community/Qwen2.5-Coder-7B-Instruct-4bit"
+DEFAULT_HOST="127.0.0.1"
+DEFAULT_PORT="11435"
+DEFAULT_CTX="8192"
+DEFAULT_MAX_KV_SIZE="4096"
+DEFAULT_TEMP_CHAT="0.2"
+DEFAULT_TEMP_CODE="0.1"
+
+MLX_HOME="${MLX_HOME:-$HOME/.local/share/mlx-cli}"
+MLX_CONFIG_DIR="${MLX_CONFIG_DIR:-$HOME/.config/mlx-cli}"
+MLX_VENV="${MLX_VENV:-$MLX_HOME/venv}"
+MLX_RUN_DIR="$MLX_HOME/run"
+MLX_LOG_DIR="$MLX_HOME/log"
+MLX_MODELS_DIR="$MLX_HOME/models"
+MLX_PROMPTS_DIR="$MLX_HOME/prompts"
+MLX_REGISTRY="$MLX_MODELS_DIR/registry.tsv"
+MLX_CONFIG_FILE="$MLX_CONFIG_DIR/config.sh"
+MLX_PID_FILE="$MLX_RUN_DIR/server.pid"
+MLX_STATE_FILE="$MLX_RUN_DIR/server.state"
+MLX_LOG_FILE="$MLX_LOG_DIR/server.log"
+MLX_DEFAULT_MODEL="${MLX_DEFAULT_MODEL:-$DEFAULT_MODEL_BOOTSTRAP}"
+
+# shellcheck disable=SC1090
+[ -f "$MLX_CONFIG_FILE" ] && . "$MLX_CONFIG_FILE"
+
+# ----- logging -----
+log() { printf '%s\n' "$*"; }
+info() { printf '[INFO] %s\n' "$*"; }
+warn() { printf '[WARN] %s\n' "$*" >&2; }
+err() { printf '[ERR ] %s\n' "$*" >&2; }
+die() { err "$*"; exit 1; }
+
+usage() {
+  cat <<USAGE
+mlx $VERSION
+
+Usage:
+  mlx install [--python VER] [--default-model MODEL] [--force]
+  mlx uninstall [--purge-models] [--purge-config] [--yes]
+  mlx add model -m MODEL [--alias NAME] [--trust-remote-code]
+  mlx pull -m MODEL [--alias NAME] [--trust-remote-code]
+  mlx rm (-m MODEL | --alias NAME) [--registry-only] [--cache-only] [--yes]
+  mlx ls [--json] [--cached-only]
+  mlx serve [-m MODEL] [--host HOST] [--port PORT] [--ctx N] [--max-kv-size N]
+            [--trust-remote-code] [--foreground] [--replace] [--log-file PATH]
+            [-- EXTRA_MLX_SERVER_ARGS...]
+  mlx stop [--force]
+  mlx status
+  mlx ps
+  mlx logs [-n LINES]
+  mlx chat [-m MODEL] [--system TEXT] [--system-file FILE] [--ctx N]
+           [--max-kv-size N] [--temperature T] [--trust-remote-code]
+           [-- EXTRA_MLX_CHAT_ARGS...]
+  mlx run {claude|codex|free-code} [-m MODEL] [extra chat args...]
+  mlx generate -m MODEL -p PROMPT [--ctx N] [--max-kv-size N]
+               [--temperature T] [--trust-remote-code]
+               [-- EXTRA_MLX_GENERATE_ARGS...]
+  mlx set-default -m MODEL
+  mlx env
+  mlx doctor
+  mlx version
+  mlx help
+
+Examples:
+  mlx install --python 3.12.10 --default-model mlx-community/Llama-3.2-3B-Instruct-4bit
+  mlx pull -m mlx-community/Qwen2.5-Coder-7B-Instruct-4bit --alias qwen-coder
+  mlx serve -m qwen-coder --port 11435
+  mlx chat -m qwen-coder --system "Be concise."
+  mlx run codex -m mlx-community/Qwen2.5-Coder-7B-Instruct-4bit
+USAGE
+}
+
+ensure_dirs() {
+  mkdir -p "$MLX_HOME" "$MLX_CONFIG_DIR" "$MLX_RUN_DIR" "$MLX_LOG_DIR" "$MLX_MODELS_DIR" "$MLX_PROMPTS_DIR"
+  [ -f "$MLX_REGISTRY" ] || : > "$MLX_REGISTRY"
+}
+
+save_config() {
+  ensure_dirs
+  cat > "$MLX_CONFIG_FILE" <<CFG
+MLX_HOME="$MLX_HOME"
+MLX_CONFIG_DIR="$MLX_CONFIG_DIR"
+MLX_VENV="$MLX_VENV"
+MLX_RUN_DIR="$MLX_RUN_DIR"
+MLX_LOG_DIR="$MLX_LOG_DIR"
+MLX_MODELS_DIR="$MLX_MODELS_DIR"
+MLX_PROMPTS_DIR="$MLX_PROMPTS_DIR"
+MLX_REGISTRY="$MLX_REGISTRY"
+MLX_CONFIG_FILE="$MLX_CONFIG_FILE"
+MLX_PID_FILE="$MLX_PID_FILE"
+MLX_STATE_FILE="$MLX_STATE_FILE"
+MLX_LOG_FILE="$MLX_LOG_FILE"
+MLX_DEFAULT_MODEL="$MLX_DEFAULT_MODEL"
+DEFAULT_HOST="${DEFAULT_HOST}"
+DEFAULT_PORT="${DEFAULT_PORT}"
+DEFAULT_CTX="${DEFAULT_CTX}"
+DEFAULT_MAX_KV_SIZE="${DEFAULT_MAX_KV_SIZE}"
+CFG
+}
+
+require_cmd() { command -v "$1" >/dev/null 2>&1 || die "Missing command: $1"; }
+
+is_macos() { [ "$(uname -s)" = "Darwin" ]; }
+is_arm64() { [ "$(uname -m)" = "arm64" ]; }
+
+ensure_platform() {
+  is_macos || die "This script targets macOS only."
+  is_arm64 || die "This script targets Apple Silicon (arm64) only."
+}
+
+pyenv_root() {
+  if command -v pyenv >/dev/null 2>&1; then
+    pyenv root 2>/dev/null || printf '%s/.pyenv\n' "$HOME"
+  else
+    printf '%s/.pyenv\n' "$HOME"
+  fi
+}
+
+init_pyenv_for_script() {
+  local root
+  root="$(pyenv_root)"
+  export PYENV_ROOT="$root"
+  [ -d "$PYENV_ROOT/bin" ] && export PATH="$PYENV_ROOT/bin:$PATH"
+  if command -v pyenv >/dev/null 2>&1; then
+    # shellcheck disable=SC2046
+    eval "$(pyenv init - bash)"
+  fi
+}
+
+venv_python() {
+  printf '%s/bin/python\n' "$MLX_VENV"
+}
+
+venv_pip() {
+  printf '%s/bin/pip\n' "$MLX_VENV"
+}
+
+venv_exec() {
+  printf '%s/bin/%s\n' "$MLX_VENV" "$1"
+}
+
+ensure_installed() {
+  [ -x "$(venv_python)" ] || die "MLX runtime is not installed. Run: mlx install"
+}
+
+python_exists_in_pyenv() {
+  local ver="$1"
+  pyenv versions --bare 2>/dev/null | grep -Fx "$ver" >/dev/null 2>&1
+}
+
+write_shell_init_hint() {
+  cat <<EOF_HINT
+Add one of these to your shell init, then restart the shell:
+
+Bash (~/.bashrc and ~/.profile):
+  export PYENV_ROOT="\$HOME/.pyenv"
+  [[ -d \$PYENV_ROOT/bin ]] && export PATH="\$PYENV_ROOT/bin:\$PATH"
+  eval "\$(pyenv init - bash)"
+
+Zsh (~/.zshrc):
+  export PYENV_ROOT="\$HOME/.pyenv"
+  [[ -d \$PYENV_ROOT/bin ]] && export PATH="\$PYENV_ROOT/bin:\$PATH"
+  eval "\$(pyenv init - zsh)"
+EOF_HINT
+}
+
+registry_add_or_update() {
+  local alias_name="$1"
+  local model_id="$2"
+  local is_default="$3"
+  local trust_remote="$4"
+  local ts tmp
+  ensure_dirs
+  ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  tmp="$(mktemp)"
+  if [ -f "$MLX_REGISTRY" ]; then
+    awk -F '\t' -v a="$alias_name" -v m="$model_id" '($1!=a && $2!=m){print $0}' "$MLX_REGISTRY" > "$tmp" || true
+  fi
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$alias_name" "$model_id" "$is_default" "$trust_remote" "$ts" "" >> "$tmp"
+  mv "$tmp" "$MLX_REGISTRY"
+}
+
+registry_find_by_alias() {
+  local alias_name="$1"
+  awk -F '\t' -v a="$alias_name" '($1==a){print $0; exit}' "$MLX_REGISTRY" 2>/dev/null || true
+}
+
+registry_find_by_model() {
+  local model_id="$1"
+  awk -F '\t' -v m="$model_id" '($2==m){print $0; exit}' "$MLX_REGISTRY" 2>/dev/null || true
+}
+
+registry_remove() {
+  local model="${1:-}"
+  local alias_name="${2:-}"
+  local tmp
+  tmp="$(mktemp)"
+  awk -F '\t' -v m="$model" -v a="$alias_name" '!(($1==a && a!="") || ($2==m && m!="")) {print $0}' "$MLX_REGISTRY" > "$tmp" || true
+  mv "$tmp" "$MLX_REGISTRY"
+}
+
+resolve_model() {
+  local input="${1:-}"
+  local line
+  if [ -z "$input" ]; then
+    printf '%s\n' "$MLX_DEFAULT_MODEL"
+    return 0
+  fi
+  line="$(registry_find_by_alias "$input")"
+  if [ -n "$line" ]; then
+    printf '%s\n' "$line" | awk -F '\t' '{print $2}'
+    return 0
+  fi
+  printf '%s\n' "$input"
+}
+
+resolve_trust_remote_for_model() {
+  local input="${1:-}"
+  local line
+  [ -n "$input" ] || { printf '0\n'; return 0; }
+  line="$(registry_find_by_alias "$input")"
+  if [ -z "$line" ]; then
+    line="$(registry_find_by_model "$input")"
+  fi
+  if [ -n "$line" ]; then
+    printf '%s\n' "$line" | awk -F '\t' '{print $4}'
+  else
+    printf '0\n'
+  fi
+}
+
+prompt_yes() {
+  local q="${1:-Are you sure?}"
+  printf '%s [y/N]: ' "$q" >&2
+  read -r ans || true
+  case "$ans" in
+    y|Y|yes|YES) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+server_is_running() {
+  [ -f "$MLX_PID_FILE" ] || return 1
+  local pid
+  pid="$(cat "$MLX_PID_FILE" 2>/dev/null || true)"
+  [ -n "$pid" ] || return 1
+  kill -0 "$pid" 2>/dev/null
+}
+
+load_state() {
+  if [ -f "$MLX_STATE_FILE" ]; then
+    # shellcheck disable=SC1090
+    . "$MLX_STATE_FILE"
+  fi
+}
+
+save_state() {
+  local model="$1"
+  local host="$2"
+  local port="$3"
+  local logf="$4"
+  cat > "$MLX_STATE_FILE" <<EOF_STATE
+MLX_SERVER_MODEL="$model"
+MLX_SERVER_HOST="$host"
+MLX_SERVER_PORT="$port"
+MLX_SERVER_LOG="$logf"
+EOF_STATE
+}
+
+healthcheck_server() {
+  local host="$1" port="$2"
+  /usr/bin/python3 - "$host" "$port" <<'PY'
+import json, sys, urllib.request
+host, port = sys.argv[1], sys.argv[2]
+url = f"http://{host}:{port}/v1/models"
+try:
+    with urllib.request.urlopen(url, timeout=2) as r:
+        data = json.loads(r.read().decode("utf-8", "replace"))
+    print("ok")
+except Exception:
+    sys.exit(1)
+PY
+}
+
+cmd_install() {
+  ensure_platform
+  ensure_dirs
+  local pyver="$PYTHON_DEFAULT" force=0 default_model="$MLX_DEFAULT_MODEL"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --python) pyver="$2"; shift 2 ;;
+      --default-model) default_model="$2"; shift 2 ;;
+      --force) force=1; shift ;;
+      -h|--help) usage; return 0 ;;
+      *) die "Unknown install option: $1" ;;
+    esac
+  done
+
+  require_cmd brew
+
+  if ! command -v pyenv >/dev/null 2>&1; then
+    info "Installing pyenv via Homebrew..."
+    brew install pyenv
+  fi
+
+  init_pyenv_for_script
+  command -v pyenv >/dev/null 2>&1 || die "pyenv not available after install."
+
+  if [ ! -d "$MLX_VENV" ] || [ "$force" -eq 1 ]; then
+    if ! python_exists_in_pyenv "$pyver"; then
+      info "Installing Python $pyver with pyenv..."
+      pyenv install "$pyver"
+    else
+      info "Python $pyver already present in pyenv."
+    fi
+
+    info "Creating virtualenv at $MLX_VENV"
+    rm -rf "$MLX_VENV"
+    "$(pyenv root)/versions/$pyver/bin/python3" -m venv "$MLX_VENV"
+  fi
+
+  info "Installing/Updating Python packages..."
+  "$(venv_pip)" install --upgrade pip setuptools wheel
+  "$(venv_pip)" install --upgrade mlx-lm huggingface_hub
+
+  MLX_DEFAULT_MODEL="$default_model"
+  save_config
+
+  info "Bootstrap model: $MLX_DEFAULT_MODEL"
+  write_shell_init_hint
+  info "Install complete."
+}
+
+cmd_uninstall() {
+  local purge_models=0 purge_config=0 yes=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --purge-models) purge_models=1; shift ;;
+      --purge-config) purge_config=1; shift ;;
+      --yes) yes=1; shift ;;
+      -h|--help) usage; return 0 ;;
+      *) die "Unknown uninstall option: $1" ;;
+    esac
+  done
+  if [ "$yes" -ne 1 ]; then
+    prompt_yes "Remove managed MLX runtime under $MLX_HOME and config under $MLX_CONFIG_DIR?" || exit 1
+  fi
+  if server_is_running; then
+    cmd_stop
+  fi
+  rm -rf "$MLX_VENV" "$MLX_RUN_DIR" "$MLX_LOG_DIR"
+  [ "$purge_models" -eq 1 ] && rm -rf "$MLX_MODELS_DIR"
+  [ "$purge_config" -eq 1 ] && rm -rf "$MLX_CONFIG_DIR"
+  info "Uninstall complete."
+}
+
+prefetch_model() {
+  local model="$1" trust_remote="$2"
+  ensure_installed
+  local tmp_py
+  tmp_py="$(mktemp)"
+  cat > "$tmp_py" <<'PY'
+import sys
+from mlx_lm import load
+model = sys.argv[1]
+trust_remote = sys.argv[2] == "1"
+load(model, tokenizer_config={"trust_remote_code": True} if trust_remote else None)
+print("ok")
+PY
+  "$(venv_python)" "$tmp_py" "$model" "$trust_remote"
+  rm -f "$tmp_py"
+}
+
+cmd_add() {
+  ensure_dirs
+  local sub="${1:-}"
+  [ -n "$sub" ] || die "Usage: mlx add model -m MODEL [--alias NAME] [--trust-remote-code]"
+  shift
+  case "$sub" in
+    model)
+      local model="" alias_name="" trust_remote=0
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          -m|--model) model="$2"; shift 2 ;;
+          --alias) alias_name="$2"; shift 2 ;;
+          --trust-remote-code) trust_remote=1; shift ;;
+          *) die "Unknown add model option: $1" ;;
+        esac
+      done
+      [ -n "$model" ] || die "Missing -m|--model"
+      [ -n "$alias_name" ] || alias_name="$(basename "$model")"
+      registry_add_or_update "$alias_name" "$model" 0 "$trust_remote"
+      info "Added alias '$alias_name' -> $model"
+      ;;
+    *)
+      die "Unknown add target: $sub"
+      ;;
+  esac
+}
+
+cmd_pull() {
+  ensure_dirs
+  local model="" alias_name="" trust_remote=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -m|--model) model="$2"; shift 2 ;;
+      --alias) alias_name="$2"; shift 2 ;;
+      --trust-remote-code) trust_remote=1; shift ;;
+      -h|--help) usage; return 0 ;;
+      *) die "Unknown pull option: $1" ;;
+    esac
+  done
+  [ -n "$model" ] || die "Missing -m|--model"
+  [ -n "$alias_name" ] || alias_name="$(basename "$model")"
+  info "Prefetching model $model ..."
+  prefetch_model "$model" "$trust_remote"
+  registry_add_or_update "$alias_name" "$model" 0 "$trust_remote"
+  info "Model ready. Alias '$alias_name' -> $model"
+}
+
+cmd_rm() {
+  ensure_dirs
+  ensure_installed
+  local model="" alias_name="" registry_only=0 cache_only=0 yes=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -m|--model) model="$2"; shift 2 ;;
+      --alias) alias_name="$2"; shift 2 ;;
+      --registry-only) registry_only=1; shift ;;
+      --cache-only) cache_only=1; shift ;;
+      --yes) yes=1; shift ;;
+      -h|--help) usage; return 0 ;;
+      *) die "Unknown rm option: $1" ;;
+    esac
+  done
+  [ -n "$model$alias_name" ] || die "Provide --alias NAME or -m MODEL"
+
+  if [ -n "$alias_name" ] && [ -z "$model" ]; then
+    local line
+    line="$(registry_find_by_alias "$alias_name")"
+    [ -n "$line" ] || die "Alias not found: $alias_name"
+    model="$(printf '%s\n' "$line" | awk -F '\t' '{print $2}')"
+  fi
+
+  if [ "$yes" -ne 1 ]; then
+    prompt_yes "Remove model registry/cache entry for '$model'?" || exit 1
+  fi
+
+  if [ "$cache_only" -ne 1 ]; then
+    registry_remove "$model" "$alias_name"
+  fi
+
+  if [ "$registry_only" -ne 1 ]; then
+    info "Attempting Hugging Face cache deletion for $model ..."
+    "$(venv_python)" - "$model" <<'PY' || true
+import sys
+model = sys.argv[1]
+try:
+    from huggingface_hub import scan_cache_dir
+    info = scan_cache_dir()
+    removed = False
+    for repo in info.repos:
+        rid = getattr(repo, "repo_id", None)
+        if rid == model or str(rid).endswith("/" + model.split("/")[-1]):
+            try:
+                strategy = info.delete_revisions(*[rev.commit_hash for rev in repo.revisions])
+                strategy.execute()
+                print("deleted")
+                removed = True
+            except Exception as e:
+                print(f"warn: {e}")
+    if not removed:
+        print("warn: matching cached repo not found")
+except Exception as e:
+    print(f"warn: cache deletion unavailable: {e}")
+PY
+  fi
+
+  info "Model removal complete."
+}
+
+cmd_ls() {
+  ensure_dirs
+  local as_json=0 cached_only=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) as_json=1; shift ;;
+      --cached-only) cached_only=1; shift ;;
+      *) die "Unknown ls option: $1" ;;
+    esac
+  done
+  if [ "$as_json" -eq 1 ]; then
+    "$(venv_python 2>/dev/null || printf '/usr/bin/python3')" - "$MLX_REGISTRY" "$cached_only" <<'PY'
+import json, os, sys
+reg = sys.argv[1]
+cached_only = sys.argv[2] == "1"
+items = []
+if os.path.exists(reg):
+    with open(reg, "r", encoding="utf-8") as f:
+        for line in f:
+            line=line.rstrip("\n")
+            if not line:
+                continue
+            parts = line.split("\t")
+            while len(parts) < 6:
+                parts.append("")
+            alias, model, default, trust, last_used, notes = parts[:6]
+            items.append({
+                "alias": alias,
+                "model": model,
+                "default": default == "1",
+                "trust_remote_code": trust == "1",
+                "last_used": last_used,
+                "notes": notes,
+            })
+print(json.dumps(items, indent=2))
+PY
+    return 0
+  fi
+  printf '%-24s %-54s %-7s %-7s %-20s\n' "ALIAS" "MODEL" "DEFAULT" "TRUST" "LAST_USED"
+  printf '%-24s %-54s %-7s %-7s %-20s\n' "-----" "-----" "-------" "-----" "---------"
+  if [ -f "$MLX_REGISTRY" ]; then
+    awk -F '\t' '{printf "%-24s %-54s %-7s %-7s %-20s\n", $1, $2, $3, $4, $5}' "$MLX_REGISTRY"
+  fi
+}
+
+cmd_serve() {
+  ensure_installed
+  ensure_dirs
+  local model="$MLX_DEFAULT_MODEL" host="$DEFAULT_HOST" port="$DEFAULT_PORT"
+  local ctx="$DEFAULT_CTX" max_kv="$DEFAULT_MAX_KV_SIZE" trust_remote=""
+  local foreground=0 replace=0 log_file="$MLX_LOG_FILE"
+  local extra_args=""
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -m|--model) model="$2"; shift 2 ;;
+      --host) host="$2"; shift 2 ;;
+      --port) port="$2"; shift 2 ;;
+      --ctx) ctx="$2"; shift 2 ;;
+      --max-kv-size) max_kv="$2"; shift 2 ;;
+      --trust-remote-code) trust_remote="--trust-remote-code"; shift ;;
+      --foreground) foreground=1; shift ;;
+      --replace) replace=1; shift ;;
+      --log-file) log_file="$2"; shift 2 ;;
+      --) shift; extra_args="$*"; break ;;
+      -h|--help) usage; return 0 ;;
+      *) die "Unknown serve option: $1" ;;
+    esac
+  done
+
+  model="$(resolve_model "$model")"
+  if [ -z "$trust_remote" ] && [ "$(resolve_trust_remote_for_model "$model")" = "1" ]; then
+    trust_remote="--trust-remote-code"
+  fi
+
+  if server_is_running; then
+    if [ "$replace" -eq 1 ]; then
+      cmd_stop
+    else
+      die "Server already running. Use mlx status or mlx serve --replace"
+    fi
+  fi
+
+  if [ "$foreground" -eq 1 ]; then
+    exec "$(venv_exec mlx_lm.server)" --model "$model" --host "$host" --port "$port" --max-kv-size "$max_kv" $trust_remote $extra_args
+  fi
+
+  info "Starting server in background..."
+  nohup "$(venv_exec mlx_lm.server)" --model "$model" --host "$host" --port "$port" --max-kv-size "$max_kv" $trust_remote $extra_args >> "$log_file" 2>&1 &
+  echo $! > "$MLX_PID_FILE"
+  save_state "$model" "$host" "$port" "$log_file"
+
+  local i=0
+  while [ "$i" -lt 20 ]; do
+    if healthcheck_server "$host" "$port" >/dev/null 2>&1; then
+      info "Server is up at http://$host:$port"
+      return 0
+    fi
+    sleep 1
+    i=$((i + 1))
+  done
+  warn "Healthcheck did not pass yet. Inspect logs: mlx logs"
+}
+
+cmd_stop() {
+  ensure_dirs
+  local force=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --force) force=1; shift ;;
+      *) die "Unknown stop option: $1" ;;
+    esac
+  done
+  if ! server_is_running; then
+    warn "No running server found."
+    rm -f "$MLX_PID_FILE" "$MLX_STATE_FILE"
+    return 0
+  fi
+  local pid
+  pid="$(cat "$MLX_PID_FILE")"
+  kill "$pid" 2>/dev/null || true
+  local i=0
+  while kill -0 "$pid" 2>/dev/null; do
+    [ "$i" -ge 10 ] && break
+    sleep 1
+    i=$((i + 1))
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    if [ "$force" -eq 1 ]; then
+      kill -9 "$pid" 2>/dev/null || true
+    else
+      die "Server did not stop cleanly. Retry with: mlx stop --force"
+    fi
+  fi
+  rm -f "$MLX_PID_FILE" "$MLX_STATE_FILE"
+  info "Server stopped."
+}
+
+cmd_status() {
+  ensure_dirs
+  if server_is_running; then
+    load_state
+    printf 'status: running\n'
+    printf 'pid: %s\n' "$(cat "$MLX_PID_FILE")"
+    printf 'model: %s\n' "${MLX_SERVER_MODEL:-unknown}"
+    printf 'host: %s\n' "${MLX_SERVER_HOST:-unknown}"
+    printf 'port: %s\n' "${MLX_SERVER_PORT:-unknown}"
+    printf 'log: %s\n' "${MLX_SERVER_LOG:-$MLX_LOG_FILE}"
+  else
+    printf 'status: stopped\n'
+  fi
+}
+
+cmd_ps() { cmd_status "$@"; }
+
+cmd_logs() {
+  ensure_dirs
+  local lines=80
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -n|--lines) lines="$2"; shift 2 ;;
+      *) die "Unknown logs option: $1" ;;
+    esac
+  done
+  [ -f "$MLX_LOG_FILE" ] || die "No log file found at $MLX_LOG_FILE"
+  tail -n "$lines" "$MLX_LOG_FILE"
+}
+
+cmd_chat() {
+  ensure_installed
+  local model="$MLX_DEFAULT_MODEL" system_text="" system_file="" ctx="$DEFAULT_CTX"
+  local max_kv="$DEFAULT_MAX_KV_SIZE" temperature="$DEFAULT_TEMP_CHAT" trust_remote=""
+  local extra_args=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -m|--model) model="$2"; shift 2 ;;
+      --system) system_text="$2"; shift 2 ;;
+      --system-file) system_file="$2"; shift 2 ;;
+      --ctx) ctx="$2"; shift 2 ;;
+      --max-kv-size) max_kv="$2"; shift 2 ;;
+      --temperature) temperature="$2"; shift 2 ;;
+      --trust-remote-code) trust_remote="--trust-remote-code"; shift ;;
+      --) shift; extra_args="$*"; break ;;
+      -h|--help) usage; return 0 ;;
+      *) die "Unknown chat option: $1" ;;
+    esac
+  done
+  model="$(resolve_model "$model")"
+  if [ -z "$trust_remote" ] && [ "$(resolve_trust_remote_for_model "$model")" = "1" ]; then
+    trust_remote="--trust-remote-code"
+  fi
+
+  if [ -n "$system_file" ]; then
+    [ -f "$system_file" ] || die "System file not found: $system_file"
+    system_text="$(cat "$system_file")"
+  fi
+
+  if [ -n "$system_text" ]; then
+    exec "$(venv_exec mlx_lm.chat)" --model "$model" --max-kv-size "$max_kv" --system "$system_text" $trust_remote $extra_args
+  else
+    exec "$(venv_exec mlx_lm.chat)" --model "$model" --max-kv-size "$max_kv" $trust_remote $extra_args
+  fi
+}
+
+cmd_generate() {
+  ensure_installed
+  local model="$MLX_DEFAULT_MODEL" prompt="" ctx="$DEFAULT_CTX" max_kv="$DEFAULT_MAX_KV_SIZE"
+  local temperature="$DEFAULT_TEMP_CHAT" trust_remote="" extra_args=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -m|--model) model="$2"; shift 2 ;;
+      -p|--prompt) prompt="$2"; shift 2 ;;
+      --ctx) ctx="$2"; shift 2 ;;
+      --max-kv-size) max_kv="$2"; shift 2 ;;
+      --temperature) temperature="$2"; shift 2 ;;
+      --trust-remote-code) trust_remote="--trust-remote-code"; shift ;;
+      --) shift; extra_args="$*"; break ;;
+      -h|--help) usage; return 0 ;;
+      *) die "Unknown generate option: $1" ;;
+    esac
+  done
+  [ -n "$prompt" ] || die "Missing -p|--prompt"
+  model="$(resolve_model "$model")"
+  if [ -z "$trust_remote" ] && [ "$(resolve_trust_remote_for_model "$model")" = "1" ]; then
+    trust_remote="--trust-remote-code"
+  fi
+  exec "$(venv_exec mlx_lm.generate)" --model "$model" --prompt "$prompt" --max-kv-size "$max_kv" $trust_remote $extra_args
+}
+
+cmd_set_default() {
+  ensure_dirs
+  local model=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -m|--model) model="$2"; shift 2 ;;
+      *) die "Unknown set-default option: $1" ;;
+    esac
+  done
+  [ -n "$model" ] || die "Missing -m|--model"
+  model="$(resolve_model "$model")"
+  MLX_DEFAULT_MODEL="$model"
+  save_config
+  info "Default model set to $model"
+}
+
+cmd_env() {
+  ensure_dirs
+  cat <<EOF_ENV
+MLX_HOME=$MLX_HOME
+MLX_CONFIG_DIR=$MLX_CONFIG_DIR
+MLX_VENV=$MLX_VENV
+MLX_REGISTRY=$MLX_REGISTRY
+MLX_PID_FILE=$MLX_PID_FILE
+MLX_STATE_FILE=$MLX_STATE_FILE
+MLX_LOG_FILE=$MLX_LOG_FILE
+MLX_DEFAULT_MODEL=$MLX_DEFAULT_MODEL
+DEFAULT_HOST=$DEFAULT_HOST
+DEFAULT_PORT=$DEFAULT_PORT
+DEFAULT_CTX=$DEFAULT_CTX
+DEFAULT_MAX_KV_SIZE=$DEFAULT_MAX_KV_SIZE
+EOF_ENV
+}
+
+cmd_doctor() {
+  ensure_dirs
+  printf 'platform: %s %s\n' "$(uname -s)" "$(uname -m)"
+  printf 'shell: %s\n' "${SHELL:-unknown}"
+  if command -v sw_vers >/dev/null 2>&1; then
+    printf 'macOS: %s\n' "$(sw_vers -productVersion 2>/dev/null || true)"
+  fi
+  if command -v pyenv >/dev/null 2>&1; then
+    printf 'pyenv: %s\n' "$(pyenv --version 2>/dev/null || true)"
+  else
+    printf 'pyenv: missing\n'
+  fi
+  if [ -x "$(venv_python)" ]; then
+    printf 'venv python: %s\n' "$("$(venv_python)" --version 2>&1)"
+    printf 'mlx_lm: '
+    "$(venv_python)" - <<'PY'
+try:
+    import mlx_lm
+    try:
+        from mlx_lm._version import __version__
+        print(__version__)
+    except Exception:
+        print("installed")
+except Exception as e:
+    print(f"not importable: {e}")
+PY
+  else
+    printf 'venv python: missing\n'
+  fi
+  if server_is_running; then
+    printf 'server: running (pid %s)\n' "$(cat "$MLX_PID_FILE")"
+  else
+    printf 'server: stopped\n'
+  fi
+  printf 'registry entries: %s\n' "$(grep -c . "$MLX_REGISTRY" 2>/dev/null || printf '0')"
+}
+
+cmd_run() {
+  ensure_installed
+  local mode="${1:-}"
+  [ -n "$mode" ] || die "Usage: mlx run {claude|codex|free-code} [-m MODEL] [extra args...]"
+  shift
+  local model="" extra=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -m|--model) model="$2"; shift 2 ;;
+      *) extra+=("$1"); shift ;;
+    esac
+  done
+  case "$mode" in
+    claude)
+      [ -n "$model" ] || model="$MLX_DEFAULT_MODEL"
+      cmd_chat -m "$model" --system "You are a careful, structured coding and research assistant. Explain tradeoffs, then give the best concrete answer. Prefer correct, maintainable code." --temperature "$DEFAULT_TEMP_CHAT" -- "${extra[@]}"
+      ;;
+    codex)
+      [ -n "$model" ] || model="$DEFAULT_MODEL_CODE"
+      cmd_chat -m "$model" --system "You are a terse software engineering assistant. Prefer exact patches, shell commands, and minimal explanation. Keep output implementation-first." --temperature "$DEFAULT_TEMP_CODE" -- "${extra[@]}"
+      ;;
+    free-code)
+      [ -n "$model" ] || model="$DEFAULT_MODEL_CODE"
+      cmd_chat -m "$model" --system "You are an open coding copilot. Produce practical code, commands, refactors, and debugging help. Be explicit about assumptions and edge cases." --temperature 0.25 -- "${extra[@]}"
+      ;;
+    *)
+      die "Unknown run mode: $mode"
+      ;;
+  esac
+}
+
+main() {
+  local cmd="${1:-help}"
+  shift || true
+  case "$cmd" in
+    install) cmd_install "$@" ;;
+    uninstall) cmd_uninstall "$@" ;;
+    add) cmd_add "$@" ;;
+    pull) cmd_pull "$@" ;;
+    rm) cmd_rm "$@" ;;
+    ls) cmd_ls "$@" ;;
+    serve) cmd_serve "$@" ;;
+    stop) cmd_stop "$@" ;;
+    status) cmd_status "$@" ;;
+    ps) cmd_ps "$@" ;;
+    logs) cmd_logs "$@" ;;
+    chat) cmd_chat "$@" ;;
+    generate) cmd_generate "$@" ;;
+    set-default) cmd_set_default "$@" ;;
+    env) cmd_env "$@" ;;
+    doctor) cmd_doctor "$@" ;;
+    run) cmd_run "$@" ;;
+    version|--version|-V) printf '%s\n' "$VERSION" ;;
+    help|-h|--help) usage ;;
+    *) die "Unknown command: $cmd" ;;
+  esac
+}
+
+main "$@"
