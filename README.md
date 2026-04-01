@@ -12,7 +12,7 @@
 
 ## 🚀 What is this?
 
-`mlx` is a **minimal, zero-bloat CLI** that brings an **Ollama-like experience** to Apple's **MLX ecosystem**.
+`mlx` is a **minimal, zero-bloat CLI** bash script that brings an **Ollama-like experience** to Apple's **MLX ecosystem** using [mlx.lm](https://github.com/ml-explore/mlx-lm)
 
 No containers. No Node. No nonsense.
 
@@ -27,12 +27,12 @@ mlx chat
 
 ## ✨ Why mlx?
 
-* 🍏 **Built for Apple Silicon (M1–M4)**
+* 🍏 **Built for Apple Silicon**
 * ⚡ **Blazing fast via MLX (Metal)**
 * 🧠 **Run HuggingFace models directly**
 * 📦 **One-command setup**
 * 🛠 **Pure Bash (no runtime lock-in)**
-* 🔥 **Feels like Ollama — but native**
+* 🔥 **Feels like Ollama**
 
 ---
 
@@ -167,7 +167,7 @@ mlx run free-code  # creative coding
 
 | Feature     | mlx | Ollama |
 | ----------- | --- | ------ |
-| Apple MLX   | ✅   | ❌      |
+| Apple MLX   | ✅   | ✅       |
 | Docker-free | ✅   | ❌      |
 | HF models   | ✅   | ❌      |
 | Bash-native | ✅   | ❌      |
