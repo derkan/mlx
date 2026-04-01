@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="0.2.0"
+VERSION="0.3.0"
 SCRIPT_NAME="mlx"
 APP_NAME="mlx-cli"
 
@@ -52,7 +52,7 @@ Usage:
   $SCRIPT_NAME pull -m MODEL [--alias NAME] [--trust-remote-code]
   $SCRIPT_NAME rm -m MODEL [--yes]
   $SCRIPT_NAME ls [--json]
-  $SCRIPT_NAME search [--fit] [--best] [--json] [--limit N] [--author ORG] [--query TEXT] [--ram GB] [--refresh]
+  $SCRIPT_NAME search [--fit] [--best] [--json] [--limit N] [--author ORG] [--community-only] [--query TEXT] [--ram GB] [--refresh]
   $SCRIPT_NAME serve [-m MODEL] [--host HOST] [--port PORT] [--max-kv-size N] [--foreground] [--replace] [--trust-remote-code]
   $SCRIPT_NAME stop [--force]
   $SCRIPT_NAME status
@@ -422,7 +422,7 @@ PY
 
 cmd_search() {
   require_install
-  local fit="0" best="0" as_json="0" limit="30" author="mlx-community" query="" ram="" refresh="0"
+  local fit="0" best="0" as_json="0" limit="30" author="" community_only="0" query="" ram="" refresh="0"
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --fit) fit="1"; shift ;;
@@ -430,14 +430,22 @@ cmd_search() {
       --json) as_json="1"; shift ;;
       --limit) limit="$2"; shift 2 ;;
       --author) author="$2"; shift 2 ;;
+      --community-only) community_only="1"; shift ;;
       --query) query="$2"; shift 2 ;;
       --ram) ram="$2"; shift 2 ;;
       --refresh) refresh="1"; shift ;;
       *) die "Unknown option for search: $1" ;;
     esac
   done
+  if [[ "$community_only" == "1" && -z "$author" ]]; then
+    author="mlx-community"
+  fi
   [[ -n "$ram" ]] || ram="$(get_total_ram_gb)"
-  local cache_file="$MLX_CACHE_DIR/search_${author//\//_}_${limit}.json"
+  local author_key="all"
+  [[ -n "$author" ]] && author_key="${author//\//_}"
+  local qhash="all"
+  [[ -n "$query" ]] && qhash="$(printf '%s' "$query" | shasum | awk '{print $1}')"
+  local cache_file="$MLX_CACHE_DIR/search_${author_key}_${qhash}_${limit}.json"
   local now epoch age
   now="$(date +%s)"
   if [[ "$refresh" != "1" && -f "$cache_file" ]]; then
@@ -445,13 +453,13 @@ cmd_search() {
     age=$(( now - epoch ))
     if [[ "$age" -lt "$MLX_SEARCH_CACHE_TTL" ]]; then
       py_inline "$cache_file" "$as_json" "$fit" "$best" "$ram" <<'PY'
-import json, math, sys, datetime
+import json, sys
 path, as_json, fit_only, best_only, ram = sys.argv[1], sys.argv[2]=='1', sys.argv[3]=='1', sys.argv[4]=='1', float(sys.argv[5])
 items = json.load(open(path))
 def rank(it):
-    return (it.get('fit_rank', 9), -float(it.get('score',0)), it.get('age_days', 10**9))
+    return (it.get('fit_rank', 9), -float(it.get('score', 0)), it.get('updated_days', 10**9), it.get('age_days', 10**9))
 if fit_only:
-    items = [x for x in items if x.get('fit_rank',9) <= 1]
+    items = [x for x in items if x.get('fit_rank', 9) <= 1]
 if best_only:
     items = sorted(items, key=rank)[:10]
 else:
@@ -460,16 +468,16 @@ if as_json:
     print(json.dumps(items, indent=2))
 else:
     print(f"# showing cached results for ~{ram:.0f} GB RAM")
-    print(f"{'MODEL':62} {'WT_GB':>7} {'FIT':>4} {'AGE':>9} {'UPDATED':>9} {'NOTES'}")
+    print(f"{'MODEL':62} {'SRC':10} {'WT_GB':>7} {'FIT':>4} {'AGE':>8} {'UPD':>8} {'NOTES'}")
     for it in items:
-        print(f"{it['id'][:62]:62} {it.get('weights_gb',0):7.1f} {it.get('fit','?'):>4} {it.get('age_human','?'):>9} {it.get('updated_human','?'):>9} {it.get('notes','')}")
+        print(f"{it['id'][:62]:62} {it.get('source', '?')[:10]:10} {it.get('weights_gb', 0):7.1f} {it.get('fit', '?'):>4} {it.get('age_human', '?'):>8} {it.get('updated_human', '?'):>8} {it.get('notes', '')}")
 PY
       return 0
     fi
   fi
 
   py_inline "$cache_file" "$author" "$query" "$limit" "$ram" "$fit" "$best" "$as_json" <<'PY'
-import json, math, os, re, sys
+import json, os, re, sys
 from datetime import datetime, timezone
 from huggingface_hub import HfApi
 
@@ -480,7 +488,6 @@ fit_only = fit_only == '1'
 best_only = best_only == '1'
 as_json = as_json == '1'
 api = HfApi(token=os.getenv('HF_TOKEN'))
-
 PARAM_RE = re.compile(r'(?i)(\d+(?:\.\d+)?)\s*([bm])\b')
 
 def parse_params(text: str):
@@ -488,11 +495,11 @@ def parse_params(text: str):
     if not m:
         return None
     val = float(m.group(1))
-    unit = m.group(2).lower()
-    return val if unit == 'b' else val / 1000.0
+    return val if m.group(2).lower() == 'b' else val / 1000.0
 
-
-def age_human(days: float) -> str:
+def age_human(days):
+    if days is None:
+        return '?'
     days = int(days)
     if days < 1:
         return 'today'
@@ -501,7 +508,6 @@ def age_human(days: float) -> str:
     if days < 365:
         return f'{days//30}mo'
     return f'{days//365}y'
-
 
 def score_fit(weights_gb, params_b, tags, model_id):
     text = ' '.join(tags).lower() + ' ' + model_id.lower()
@@ -518,16 +524,42 @@ def score_fit(weights_gb, params_b, tags, model_id):
         return '⚠️', 1, round(80 - est_need, 2), est_need
     return '❌', 2, round(40 - est_need, 2), est_need
 
-models = list(api.list_models(author=author, search=query or None, limit=limit, full=True, cardData=False))
+def is_mlx_model(model, tags):
+    tags = [str(t).lower() for t in (tags or [])]
+    if 'mlx' in tags or 'library:mlx' in tags:
+        return True
+    library_name = getattr(model, 'library_name', None)
+    if library_name and str(library_name).lower() == 'mlx':
+        return True
+    model_id = getattr(model, 'id', '') or ''
+    lowered = model_id.lower()
+    return lowered.endswith('-mlx') or '-mlx-' in lowered
+
+def fetch_models():
+    params = dict(search=query or None, limit=limit, full=True, cardData=False)
+    if author:
+        params['author'] = author
+    try:
+        return list(api.list_models(filter='mlx', **params))
+    except Exception:
+        models = list(api.list_models(**params))
+        return [m for m in models if is_mlx_model(m, getattr(m, 'tags', None))]
+
+models = fetch_models()
 items = []
 now = datetime.now(timezone.utc)
 for m in models:
+    model_tags = list(getattr(m, 'tags', None) or [])
+    if not is_mlx_model(m, model_tags):
+        continue
     try:
         info = api.model_info(m.id, files_metadata=True)
     except Exception:
         continue
     siblings = getattr(info, 'siblings', None) or []
-    tags = list(getattr(info, 'tags', None) or getattr(m, 'tags', None) or [])
+    tags = list(getattr(info, 'tags', None) or model_tags or [])
+    if not is_mlx_model(m, tags):
+        continue
     created = getattr(info, 'created_at', None) or getattr(info, 'createdAt', None) or getattr(m, 'created_at', None) or getattr(m, 'createdAt', None)
     updated = getattr(info, 'last_modified', None) or getattr(info, 'lastModified', None) or getattr(m, 'last_modified', None) or getattr(m, 'lastModified', None)
     weight_bytes = 0
@@ -542,28 +574,37 @@ for m in models:
         if not size:
             continue
         low = name.lower()
-        if low.endswith(('.safetensors','.bin','.gguf','.npz','.mlx')) or 'model-' in low:
+        if low.endswith(('.safetensors', '.bin', '.npz', '.mlx')) or 'model-' in low:
             weight_bytes += int(size)
             largest_bytes = max(largest_bytes, int(size))
     weights_gb = round(weight_bytes / (1024**3), 2) if weight_bytes else round(largest_bytes / (1024**3), 2)
     params_b = parse_params(m.id)
     fit, fit_rank, score, est_need = score_fit(weights_gb, params_b, tags, m.id)
-    notes = []
     lower = m.id.lower() + ' ' + ' '.join(tags).lower()
+    source = 'official' if m.id.startswith('mlx-community/') else 'community'
+    notes = []
     if 'coder' in lower or 'code' in lower:
         notes.append('coding')
-    if any(k in lower for k in ['4bit','4-bit','int4','q4']):
+    if any(k in lower for k in ['4bit', '4-bit', 'int4', 'q4']):
         notes.append('4bit')
-    if any(k in lower for k in ['trust-remote-code','remote-code']):
+    if any(k in lower for k in ['8bit', '8-bit', 'int8', 'q8']):
+        notes.append('8bit')
+    if any(k in lower for k in ['trust-remote-code', 'remote-code']):
         notes.append('remote-code')
-    age_days = None
-    updated_days = None
-    if created:
-        age_days = max(0, (now - created).total_seconds() / 86400.0)
-    if updated:
-        updated_days = max(0, (now - updated).total_seconds() / 86400.0)
+    age_days = max(0, (now - created).total_seconds() / 86400.0) if created else None
+    updated_days = max(0, (now - updated).total_seconds() / 86400.0) if updated else None
+    recency_bonus = 0
+    if updated_days is not None:
+        if updated_days <= 7:
+            recency_bonus = 8
+        elif updated_days <= 30:
+            recency_bonus = 4
+        elif updated_days <= 90:
+            recency_bonus = 1
+    score += recency_bonus + (3 if source == 'official' else 0)
     items.append({
         'id': m.id,
+        'source': source,
         'params_b': params_b,
         'weights_gb': weights_gb,
         'fit': fit,
@@ -574,14 +615,14 @@ for m in models:
         'updated_at': updated.isoformat() if updated else None,
         'age_days': round(age_days, 1) if age_days is not None else None,
         'updated_days': round(updated_days, 1) if updated_days is not None else None,
-        'age_human': age_human(age_days) if age_days is not None else '?',
-        'updated_human': age_human(updated_days) if updated_days is not None else '?',
+        'age_human': age_human(age_days),
+        'updated_human': age_human(updated_days),
         'downloads': getattr(info, 'downloads', None) or getattr(m, 'downloads', None),
         'likes': getattr(info, 'likes', None) or getattr(m, 'likes', None),
         'notes': ', '.join(notes),
     })
 
-items = sorted(items, key=lambda x: (x['fit_rank'], -(x['score'] or 0), x['age_days'] if x['age_days'] is not None else 10**9, x['updated_days'] if x['updated_days'] is not None else 10**9, x['id']))
+items = sorted(items, key=lambda x: (x['fit_rank'], -(x['score'] or 0), x['updated_days'] if x['updated_days'] is not None else 10**9, x['age_days'] if x['age_days'] is not None else 10**9, x['id']))
 with open(cache_file, 'w') as f:
     json.dump(items, f, indent=2)
 if fit_only:
@@ -592,9 +633,9 @@ if as_json:
     print(json.dumps(items, indent=2))
 else:
     print(f"# detected RAM: {ram:.1f} GB")
-    print(f"{'MODEL':62} {'WT_GB':>7} {'FIT':>4} {'AGE':>9} {'UPDATED':>9} {'NOTES'}")
+    print(f"{'MODEL':62} {'SRC':10} {'WT_GB':>7} {'FIT':>4} {'AGE':>8} {'UPD':>8} {'NOTES'}")
     for it in items:
-        print(f"{it['id'][:62]:62} {it.get('weights_gb',0):7.1f} {it.get('fit','?'):>4} {it.get('age_human','?'):>9} {it.get('updated_human','?'):>9} {it.get('notes','')}")
+        print(f"{it['id'][:62]:62} {it.get('source', '?')[:10]:10} {it.get('weights_gb', 0):7.1f} {it.get('fit', '?'):>4} {it.get('age_human', '?'):>8} {it.get('updated_human', '?'):>8} {it.get('notes', '')}")
 PY
 }
 
