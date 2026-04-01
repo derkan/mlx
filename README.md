@@ -80,6 +80,7 @@ mlx chat                   # interactive chat
 mlx serve                  # background server
 mlx stop                   # stop server
 mlx run codex              # coding preset
+mlx search                 # search for models at HuggingFace 
 ```
 
 ---
@@ -121,6 +122,46 @@ mlx stop
 ```
 
 ---
+
+## Model Search
+
+```bash
+mlx search
+mlx search --fit
+mlx search --best
+mlx search --fit --limit 50
+mlx search --fit --ram 48
+mlx search --json
+mlx search --refresh
+```
+
+> mlx search --fit is an estimate based on model repo metadata, quantization hints, weight sizes, and available RAM. It is meant to be useful and conservative, not perfect.
+
+Useful flags:
+
+```bash
+mlx search --fit           # only models likely to fit this machine
+mlx search --best          # best near-term picks
+mlx search --ram 48        # override auto-detected RAM
+mlx search --limit 50      # fetch more repos
+mlx search --refresh       # bypass cache
+mlx search --json          # machine-readable output
+```
+
+Example:
+
+```bash
+mlx search --fit
+```
+
+Output:
+```bash
+MODEL                                                          WT_GB  FIT       AGE   UPDATED NOTES
+mlx-community/Qwen2.5-Coder-7B-Instruct-4bit                     4.8   ✅        2mo       3d coding, 4bit
+mlx-community/Llama-3.1-8B-Instruct-4bit                        5.2   ✅        4mo       1w 4bit
+mlx-community/Qwen2.5-Coder-14B-Instruct-4bit                   9.1   ✅        1mo       5d coding, 4bit
+mlx-community/Mixtral-8x7B-Instruct-4bit                       26.4   ⚠️        6mo       2w 4bit
+```
 
 ## 🧰 Presets
 
